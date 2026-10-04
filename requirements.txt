@@ -1,0 +1,3 @@
+# Core program and tests use the Python standard library only.
+# matplotlib is used only by experiments/plot_results.py to draw graphs.
+matplotlib
