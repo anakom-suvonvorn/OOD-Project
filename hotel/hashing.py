@@ -33,4 +33,5 @@ def hash64(text: str) -> int:
 
     Returns an int in [0, RING_SIZE - 1]. Same text gives the same result on every run.
     """
-    raise NotImplementedError("P1")  # uses hashlib
+    digest = hashlib.sha256(text.encode("utf-8")).digest()
+    return int.from_bytes(digest[: RING_BITS // 8], "big")
