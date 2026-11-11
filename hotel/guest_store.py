@@ -85,7 +85,6 @@ class GuestStore:
         if self.node_counts[node_id] == 0:
             del self.node_counts[node_id]
 
-        guest.point = None
         return guest
 
     def move(self, guest: Guest, new_point: RingPoint) -> int:
