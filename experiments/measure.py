@@ -12,6 +12,12 @@ from typing import Any, Callable
 
 def time_call(fn: Callable[..., Any], *args: Any) -> tuple[Any, float]:
     """Run fn(*args) once; return (result, seconds)."""
+    start_t = time.perf_counter()
+    result = fn(*args)
+    end_t = time.perf_counter()
+    
+    worked_time = end_t - start_t
+    return result, worked_time
     raise NotImplementedError("P4")
 
 
