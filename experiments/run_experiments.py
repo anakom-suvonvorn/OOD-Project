@@ -1,23 +1,29 @@
 """Experiments A, B, C (owner: P4). Run: python -m experiments.run_experiments
 
-Writes results/experiment_*.csv in the long format of PLAN.md section 11.3.
+Writes results/experiment_*.csv in the long format of PLAN.md section 11.3:
+experiment, method, salt, K, N, V, metric, value, unit
 """
 from __future__ import annotations
 
 import csv
 import time
 from pathlib import Path
-from typing import Any
 
-from .measure import time_call, measure_memory, get_system_env
+from .measure import get_system_env, measure_memory, time_call
 from hotel.hotel_system import HotelSystem
+from hotel.mod_n import ModNRouter
+from hotel.ring import HashRing
 
 SALTS = ("0", "1", "2")
 CHANNELS = 10
 SEARCH_BATCH_SIZE = 1000
+RESULTS_DIR = Path(__file__).resolve().parent.parent / "results"
+CSV_COLUMNS = ["experiment", "method", "salt", "K", "N", "V", "metric", "value", "unit"]
 
-def append_metric(rows: list[dict], exp: str, method: str, salt: str, k: int, n: int, v: int, metric: str, val: float | int, unit: str):
-    """Helper for formatted Long-Format CSV writing."""
+
+def append_metric(rows: list[dict], exp: str, method: str, salt: str, k: int, n: int, v: int,
+                  metric: str, val: float | int | None, unit: str) -> None:
+    """Append one row in the long CSV format."""
     rows.append({
         "experiment": exp,
         "method": method,
@@ -27,243 +33,266 @@ def append_metric(rows: list[dict], exp: str, method: str, salt: str, k: int, n:
         "V": v,
         "metric": metric,
         "value": val,
-        "unit": unit
+        "unit": unit,
     })
-    
-def _get_moves_count(report: Any) -> int:
-    """Extract number of moves from MoveReport object or integer count."""
-    if hasattr(report, "moves"):
-        return len(report.moves)
-    elif hasattr(report, "total_moves"):
-        return report.total_moves
-    elif isinstance(report, (int, float)):
-        return int(report)
-    return 0
 
-def _mod_n_moves(system: HotelSystem, action: str, target_node: int) -> int:
-    """Calculate exact guest moves under Hash Mod N when adding or removing target_node."""
-    nodes = system.node_ids()
-    n = len(nodes)
-    if n == 0:
-        return 0
-
-    guests = list(system.guests())
-    moves = 0
-
-    if action == "add":
-        new_n = n + 1
-        for g in guests:
-            old_node = (g.pos % n) + 1
-            new_node = (g.pos % new_n) + 1
-            if old_node != new_node:
-                moves += 1
-    elif action == "remove":
-        new_n = max(1, n - 1)
-        for g in guests:
-            old_node = (g.pos % n) + 1
-            new_node = (g.pos % new_n) + 1
-            if old_node != new_node:
-                moves += 1
-
-    return moves
 
 def channel_sizes(k: int, channels: int = CHANNELS) -> list[int]:
     """Split k guests over `channels` channels as evenly as possible (sizes differ by at most 1)."""
     base = k // channels
     remainders = k % channels
-    
     return [base + 1 if i < remainders else base for i in range(channels)]
 
+
+def _search_targets(system: HotelSystem) -> list:
+    """SEARCH_BATCH_SIZE guests to search for, cycling through the guests if K < batch size."""
+    guests = list(system.guests())
+    if not guests:
+        return []
+    return [guests[i % len(guests)] for i in range(SEARCH_BATCH_SIZE)]
+
+
+def _time_searches(system: HotelSystem) -> tuple[float, float]:
+    """Seconds per search (guest id, then room address), timed over one batch of 1,000."""
+    targets = _search_targets(system)
+    if not targets:
+        return 0.0, 0.0
+    ids = [(g.c, g.s) for g in targets]
+    rooms = [(g.node_id, g.room_no) for g in targets]
+
+    def by_guest():
+        for c, s in ids:
+            system.find_guest(c, s)
+
+    def by_room():
+        for node_id, room_no in rooms:
+            system.find_by_room(node_id, room_no)
+
+    _, t_guest = time_call(by_guest)
+    _, t_room = time_call(by_room)
+    return t_guest / len(ids), t_room / len(rooms)
+
+
+def _place_all(system: HotelSystem, sizes: list[int]) -> None:
+    """Place every channel's guests into a system whose ring is already built."""
+    for c, size in enumerate(sizes, start=1):
+        system.add_guests(c, 1, size)
+
+
+def _mod_n_change(
+    system: HotelSystem,
+    action: str,
+    node_id: int,
+    building_order: list[int] | None = None,
+) -> tuple[int, float]:
+    """hash mod N on the same guest positions and the same building change (PDF 7.1).
+
+    Pass `building_order` to use the original insertion order of all current buildings.
+    The default is ascending id order, as used by initialize. "add" appends and "remove"
+    preserves the order of the remaining buildings. Moves are counted using building IDs.
+    An invalid building order raises ValueError.
+    The timed part is the router update plus recomputing every guest, because mod N has no
+    way to find who moved without checking all K guests. Returns (moved, seconds).
+    """
+    current_nodes = system.node_ids()
+    if building_order is not None and (
+        len(building_order) != len(current_nodes) or set(building_order) != set(current_nodes)
+    ):
+        raise ValueError("building_order must contain exactly the current buildings")
+    router = ModNRouter()
+    router.build(current_nodes if building_order is None else building_order)
+    guests = list(system.guests())
+    before = [router.node_for(g.pos) for g in guests]
+
+    start = time.perf_counter()
+    if action == "add":
+        router.add_node(node_id)
+    elif action == "remove":
+        router.remove_node(node_id)
+    else:
+        raise ValueError(f"unknown action: {action}")
+    moved = sum(1 for g, old in zip(guests, before) if router.node_for(g.pos) != old)
+    seconds = time.perf_counter() - start
+    return moved, seconds
+
+
 def run_experiment_a(salts=SALTS) -> list[dict]:
-    """K = 1,000 / 10,000 / 100,000 with N = 10, V = 32: time to place, search, sort; memory."""
-    rows = []
-    n = 10
-    v = 32
-    
+    """K = 1,000 / 10,000 / 100,000 with N = 10, V = 32: time to build the ring, place guests,
+    search, sort; memory (separate run)."""
+    rows: list[dict] = []
+    n, v = 10, 32
+
     for k in (1000, 10000, 100000):
-        cs = channel_sizes(k)
+        sizes = channel_sizes(k)
         for salt in salts:
-            try:
-                system, t_place = time_call(HotelSystem.initialize, n, v, cs, salt = salt)
-                _, current_mib, peak_mib = measure_memory(HotelSystem.initialize, n, v, cs, salt = salt)
-                
-                guest_sample = list(system.guests())
-                search_target = [(guest_sample[i % len(guest_sample)].c, guest_sample[i % len(guest_sample)].s) for i in range(SEARCH_BATCH_SIZE)]
-                
-                def search_batch():
-                    for c, s in search_target:
-                        system.find_guest(c, s)
-                        
-                _, total_search_guest_time = time_call(search_batch)
-                t_search_guest = total_search_guest_time / SEARCH_BATCH_SIZE
-                
-                def search_room_batch():
-                    for i in range(SEARCH_BATCH_SIZE):
-                        g = guest_sample[i % len(guest_sample)]
-                        system.find_by_room(g.node_id, g.room_no)
-                        
-                _, total_search_room_time = time_call(search_room_batch)
-                t_search_room = total_search_room_time / SEARCH_BATCH_SIZE
-                
-                _, t_sorted_room = time_call(system.list_rooms)
-                
-                append_metric(rows, "A", "consistent", salt, k, n, v, "time_place", t_place, "seconds")
-                append_metric(rows, "A", "consistent", salt, k, n, v, "time_search_guest", t_search_guest, "seconds")
-                append_metric(rows, "A", "consistent", salt, k, n, v, "time_search_room", t_search_room, "seconds")
-                append_metric(rows, "A", "consistent", salt, k, n, v, "time_sort", t_sorted_room, "seconds")
-                append_metric(rows, "A", "consistent", salt, k, n, v, "memory_current", current_mib, "MiB")
-                append_metric(rows, "A", "consistent", salt, k, n, v, "memory_peak", peak_mib, "MiB")
-            except MemoryError:
-                print(f"[WARN] Memory limit exceeded at K={k}, salt={salt}")
-                break
+            # Ring build and guest placement timed separately (PDF 7.2).
+            _, t_ring = time_call(HashRing(v, salt).build, range(1, n + 1))
+            system = HotelSystem(v, salt)
+            system.ring.build(range(1, n + 1))
+            _, t_place = time_call(_place_all, system, sizes)
+
+            t_search_guest, t_search_room = _time_searches(system)
+            _, t_sort = time_call(system.list_rooms)
+
+            # Memory in its own run, never mixed with timing.
+            _, current_mib, peak_mib = measure_memory(HotelSystem.initialize, n, v, sizes, salt)
+
+            append_metric(rows, "A", "consistent", salt, k, n, v, "time_ring_build", t_ring, "seconds")
+            append_metric(rows, "A", "consistent", salt, k, n, v, "time_place", t_place, "seconds")
+            append_metric(rows, "A", "consistent", salt, k, n, v, "time_search_guest", t_search_guest, "seconds")
+            append_metric(rows, "A", "consistent", salt, k, n, v, "time_search_room", t_search_room, "seconds")
+            append_metric(rows, "A", "consistent", salt, k, n, v, "time_sort", t_sort, "seconds")
+            append_metric(rows, "A", "consistent", salt, k, n, v, "memory_current", current_mib, "MiB")
+            append_metric(rows, "A", "consistent", salt, k, n, v, "memory_peak", peak_mib, "MiB")
+
     save_to_csv(rows, "experiment_a.csv")
+    return rows
+
 
 def run_experiment_b(salts=SALTS) -> list[dict]:
-    """N = 5 / 10 / 20 with K = 10,000, V = 32: add 1 and remove 1 building, both methods."""
-    result = []
-    k = 10000
-    v = 32
+    """N = 5 / 10 / 20 with K = 10,000, V = 32: add building N + 1 and remove building
+    N // 2 + 1, each from the same starting state, for both methods."""
+    rows: list[dict] = []
+    k, v = 10000, 32
+    sizes = channel_sizes(k)
     for n in (5, 10, 20):
         middle = n // 2 + 1
-        cs = channel_sizes(k)
         for salt in salts:
-            base_system = HotelSystem.initialize(n, v, cs, salt)
-            for action, target_node in [("add", n + 1), ("remove", middle)]:
-                comp_result = compare_with_mod_n(base_system, action, target_node)
-                for res in comp_result:
-                    res.update({"experiment": "B", "K": k, "N": n, "V": v, "salt": salt})
-                    result.append(res)
-    
-    save_to_csv(result, "experiment_b.csv")
-    return result
+            base_system = HotelSystem.initialize(n, v, sizes, salt)
+            for action, target_node in (("add", n + 1), ("remove", middle)):
+                for res in compare_with_mod_n(base_system, action, target_node):
+                    append_metric(rows, "B", res["method"], salt, k, n, v,
+                                  res["metric"], res["value"], res["unit"])
+
+    save_to_csv(rows, "experiment_b.csv")
+    return rows
+
 
 def run_experiment_c(salts=SALTS) -> list[dict]:
     """V = 1 / 8 / 32 with N = 10, K = 10,000: guests per building, CV, memory, moves."""
-    result = []
-    k = 10000
-    n = 10
-    cs = channel_sizes(k)
+    rows: list[dict] = []
+    k, n = 10000, 10
+    sizes = channel_sizes(k)
     middle = n // 2 + 1
     for v in (1, 8, 32):
         for salt in salts:
-            system, current_mib, peak_mib = measure_memory(HotelSystem.initialize, n, v, cs, salt)
-            
+            system, current_mib, peak_mib = measure_memory(HotelSystem.initialize, n, v, sizes, salt)
+            # The ring alone, so the effect of V is not hidden by the K guests' data.
+            _, ring_current_mib, ring_peak_mib = measure_memory(HashRing(v, salt).build, range(1, n + 1))
             stats = system.load_stats()
-            
-            sys_add = system.clone()
-            report_add = sys_add.add_building(n + 1)
-            move_add = _get_moves_count(report_add)
-            
-            sys_rem = system.clone()
-            report_rem = sys_rem.remove_building(middle)
-            move_rem = _get_moves_count(report_rem)
-            
-            append_metric(result, "C", "consistent", salt, k, n, v, "guests_max", stats.maximum, "guests")
-            append_metric(result, "C", "consistent", salt, k, n, v, "guests_min", stats.minimum, "guests")
-            append_metric(result, "C", "consistent", salt, k, n, v, "guests_mean", stats.mean, "guests")
-            append_metric(result, "C", "consistent", salt, k, n, v, "guests_std", stats.std, "guests")
-            append_metric(result, "C", "consistent", salt, k, n, v, "guests_cv", stats.cv if stats.cv is not None else 0.0, "ratio")
-            append_metric(result, "C", "consistent", salt, k, n, v, "memory_current", current_mib, "MiB")
-            append_metric(result, "C", "consistent", salt, k, n, v, "memory_peak", peak_mib, "MiB")
-            append_metric(result, "C", "consistent", salt, k, n, v, "moves_add", move_add, "guests")
-            append_metric(result, "C", "consistent", salt, k, n, v, "moves_remove", move_rem, "guests")
-            
-    save_to_csv(result, "experiment_c.csv")
-    return result
+            report_add = system.clone().add_building(n + 1)
+            report_rem = system.clone().remove_building(middle)
+
+            append_metric(rows, "C", "consistent", salt, k, n, v, "guests_max", stats.maximum, "guests")
+            append_metric(rows, "C", "consistent", salt, k, n, v, "guests_min", stats.minimum, "guests")
+            append_metric(rows, "C", "consistent", salt, k, n, v, "guests_mean", stats.mean, "guests")
+            append_metric(rows, "C", "consistent", salt, k, n, v, "guests_std", stats.std, "guests")
+            append_metric(rows, "C", "consistent", salt, k, n, v, "guests_cv", stats.cv, "ratio")
+            append_metric(rows, "C", "consistent", salt, k, n, v, "ring_points", len(system.ring), "points")
+            append_metric(rows, "C", "consistent", salt, k, n, v, "memory_current", current_mib, "MiB")
+            append_metric(rows, "C", "consistent", salt, k, n, v, "memory_peak", peak_mib, "MiB")
+            append_metric(rows, "C", "consistent", salt, k, n, v, "memory_ring_current", ring_current_mib, "MiB")
+            append_metric(rows, "C", "consistent", salt, k, n, v, "memory_ring_peak", ring_peak_mib, "MiB")
+            append_metric(rows, "C", "consistent", salt, k, n, v, "moves_add", report_add.moved_count, "guests")
+            append_metric(rows, "C", "consistent", salt, k, n, v, "move_rate_add", report_add.move_rate, "ratio")
+            append_metric(rows, "C", "consistent", salt, k, n, v, "moves_remove", report_rem.moved_count, "guests")
+            append_metric(rows, "C", "consistent", salt, k, n, v, "move_rate_remove", report_rem.move_rate, "ratio")
+
+    save_to_csv(rows, "experiment_c.csv")
+    return rows
+
 
 def benchmark_system(system: HotelSystem) -> list[dict]:
-    """For the menu: time the main operations on (a clone of) the current system. Must not change `system`."""
-    sys = system.clone()
-    result = []
-    
-    guest_sample = list(sys.guests())
-    if guest_sample:
-        search_target = [(guest_sample[i % len(guest_sample)].c, [i % len(guest_sample)].s) for i in range(min(SEARCH_BATCH_SIZE, len(guest_sample)))]
+    """For the menu: time and memory of the main operations on a clone of the current system.
 
-        def search_batch():
-            for c, s in search_target:
-                sys.find_guest(c, s)
-                
-        _,t_search = time_call(search_batch)
-        t_search_per_op = t_search / len(search_target)
-    else:
-        t_search_per_op = 0.0
-    
-    _, t_sort = time_call(sys.list_rooms)
-    _, t_stats = time_call(sys.load_stats)
-    
-    result.append({"operation": "search_guest", "time_sec": t_search_per_op})
-    result.append({"operation": "list_rooms", "time_sec": t_sort})
-    result.append({"operation": "load_stats", "time_sec": t_stats})
+    Must not change `system`. Rows: {"K", "N", "V", "salt", "metric", "value", "unit"}.
+    Searches are timed over a batch of 1,000 and reported per search (PDF 7.2)."""
+    params = {"K": system.guest_count, "N": len(system.node_ids()), "V": system.V, "salt": system.salt}
+    copy = system.clone()
+    rows: list[dict] = []
 
-    return result
+    def add(metric: str, value: float, unit: str) -> None:
+        rows.append({**params, "metric": metric, "value": value, "unit": unit})
 
-def compare_with_mod_n(system: HotelSystem, action: str, node_id: int) -> list[dict]:
-    """For the menu: moves / rate / time of `action` ("add" or "remove") for consistent hashing vs
-    hash mod N on the current guests. Works on clones - must not change `system`."""
-    results = []
+    t_guest, t_room = _time_searches(copy)
+    add("time_search_guest", t_guest, "seconds per search")
+    add("time_search_room", t_room, "seconds per search")
+    _, t_sort = time_call(copy.list_rooms)
+    add("time_list_rooms", t_sort, "seconds")
+    _, t_stats = time_call(copy.load_stats)
+    add("time_load_stats", t_stats, "seconds")
+
+    # Memory of a full copy of the hotel, measured in a run of its own.
+    _, current_mib, peak_mib = measure_memory(system.clone)
+    add("memory_current", current_mib, "MiB (tracemalloc)")
+    add("memory_peak", peak_mib, "MiB (tracemalloc)")
+    return rows
+
+
+def compare_with_mod_n(
+    system: HotelSystem,
+    action: str,
+    node_id: int,
+    building_order: list[int] | None = None,
+) -> list[dict]:
+    """For the menu and experiment B: moves / rate / time of `action` ("add" or "remove")
+    for consistent hashing vs hash mod N on the current guests. Works on a clone - never
+    changes `system`. Raises HotelError (e.g. DuplicateNodeError) for an invalid change.
+    Pass `building_order` for the baseline's insertion order; defaults to ascending IDs.
+    Rows: {"method", "metric", "value", "unit"}; move rate is None when K == 0."""
+    if action not in ("add", "remove"):
+        raise ValueError(f"unknown action: {action}")
     k = system.guest_count
-    metric_prefix = "_add" if action == "add" else "_remove"
-    
-    sys_ch = system.clone()
-    if action == "add":
-        report_ch, t_ch = time_call(sys_ch.add_building, node_id)
-    elif action == "remove":
-        report_ch, t_ch = time_call(sys_ch.remove_building, node_id)
-    else:
-        raise ValueError(f"Unknown action:  {action}")
-    
-    move_ch = _get_moves_count(report_ch)
-    rate_ch = move_ch / k if k > 0 else 0.0
-    
-    results.append({"method": "consistent", "metric": f"moves{metric_prefix}", "value": move_ch, "unit": "guests"})
-    results.append({"method": "consistent", "metric": f"move_rate{metric_prefix}", "value": rate_ch, "unit": "ratio"})
-    results.append({"method": "consistent", "metric": f"time{metric_prefix}", "value": t_ch, "unit": "seconds"})
-    
-    t0 = time.perf_counter()
-    move_mod = _mod_n_moves(system, action, node_id)
-    time_mod = time.perf_counter() - t0
-    rate_mod = move_mod / k if k > 0 else 0.0
-    
-    results.append({"method": "mod_n", "metric": f"moves{metric_prefix}", "value": move_mod, "unit": "guests"})
-    results.append({"method": "mod_n", "metric": f"move_rate{metric_prefix}", "value": rate_mod, "unit": "ratio"})
-    results.append({"method": "mod_n", "metric": f"time{metric_prefix}", "value": time_mod, "unit": "seconds"})
-    
-    return results
+    suffix = "_" + action
+
+    ch_system = system.clone()
+    change = ch_system.add_building if action == "add" else ch_system.remove_building
+    report, t_ch = time_call(change, node_id)
+
+    moved_mod, t_mod = _mod_n_change(system, action, node_id, building_order=building_order)
+    rate_mod = moved_mod / k if k > 0 else None
+
+    return [
+        {"method": "consistent", "metric": "moves" + suffix, "value": report.moved_count, "unit": "guests"},
+        {"method": "consistent", "metric": "move_rate" + suffix, "value": report.move_rate, "unit": "ratio"},
+        {"method": "consistent", "metric": "time" + suffix, "value": t_ch, "unit": "seconds"},
+        {"method": "mod_n", "metric": "moves" + suffix, "value": moved_mod, "unit": "guests"},
+        {"method": "mod_n", "metric": "move_rate" + suffix, "value": rate_mod, "unit": "ratio"},
+        {"method": "mod_n", "metric": "time" + suffix, "value": t_mod, "unit": "seconds"},
+    ]
+
 
 def save_to_csv(data: list[dict], filename: str) -> None:
-    """Write rows list directly into results/*.csv in long format."""
+    """Write rows into results/<filename> in the long format."""
     if not data:
         return
-    filepath = Path("results") / filename
-    filepath.parent.mkdir(parents=True, exist_ok=True)
-    keys = ["experiment", "method", "salt", "K", "N", "V", "metric", "value", "unit"]
-    with open(filepath, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=keys)
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    with open(RESULTS_DIR / filename, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
         writer.writeheader()
         writer.writerows(data)
-        
-def record_system_environment() -> None:
-    env = get_system_env()
 
-    filepath = Path("results") / "specs_when_experiment.csv"
-    filepath.parent.mkdir(parents=True, exist_ok=True)
-    keys = ["python_version", "platform", "processor", "cpu_count"]
-    with open(filepath, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=keys)
+
+def record_system_environment() -> None:
+    """Save the machine and Python version the results were produced on."""
+    env = get_system_env()
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    with open(RESULTS_DIR / "specs_when_experiment.csv", "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=list(env))
         writer.writeheader()
         writer.writerow(env)
-    return
+
 
 def main() -> None:
-    print("Executiing System Environment")
-    record_system_environment()    
-    print("Executing Experiment A...")
+    print("Recording system environment...")
+    record_system_environment()
+    print("Running experiment A...")
     run_experiment_a()
-    print("Executing Experiment B...")
+    print("Running experiment B...")
     run_experiment_b()
-    print("Executing Experiment C...")
+    print("Running experiment C...")
     run_experiment_c()
+    print(f"Done. CSV files are in {RESULTS_DIR}")
 
 
 if __name__ == "__main__":
