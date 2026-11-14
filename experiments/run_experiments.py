@@ -79,17 +79,28 @@ def _place_all(system: HotelSystem, sizes: list[int]) -> None:
         system.add_guests(c, 1, size)
 
 
-def _mod_n_change(system: HotelSystem, action: str, node_id: int) -> tuple[int, float]:
+def _mod_n_change(
+    system: HotelSystem,
+    action: str,
+    node_id: int,
+    building_order: list[int] | None = None,
+) -> tuple[int, float]:
     """hash mod N on the same guest positions and the same building change (PDF 7.1).
 
-    Building ids are kept in the order they were added (ascending ids, which is the order
-    initialize adds them); "add" appends, "remove" deletes the target and keeps the order
-    of the rest, and moves are counted by comparing real building ids, not indexes.
+    Pass `building_order` to use the original insertion order of all current buildings.
+    The default is ascending id order, as used by initialize. "add" appends and "remove"
+    preserves the order of the remaining buildings. Moves are counted using building IDs.
+    An invalid building order raises ValueError.
     The timed part is the router update plus recomputing every guest, because mod N has no
     way to find who moved without checking all K guests. Returns (moved, seconds).
     """
+    current_nodes = system.node_ids()
+    if building_order is not None and (
+        len(building_order) != len(current_nodes) or set(building_order) != set(current_nodes)
+    ):
+        raise ValueError("building_order must contain exactly the current buildings")
     router = ModNRouter()
-    router.build(system.node_ids())
+    router.build(current_nodes if building_order is None else building_order)
     guests = list(system.guests())
     before = [router.node_for(g.pos) for g in guests]
 
@@ -218,10 +229,16 @@ def benchmark_system(system: HotelSystem) -> list[dict]:
     return rows
 
 
-def compare_with_mod_n(system: HotelSystem, action: str, node_id: int) -> list[dict]:
+def compare_with_mod_n(
+    system: HotelSystem,
+    action: str,
+    node_id: int,
+    building_order: list[int] | None = None,
+) -> list[dict]:
     """For the menu and experiment B: moves / rate / time of `action` ("add" or "remove")
     for consistent hashing vs hash mod N on the current guests. Works on a clone - never
     changes `system`. Raises HotelError (e.g. DuplicateNodeError) for an invalid change.
+    Pass `building_order` for the baseline's insertion order; defaults to ascending IDs.
     Rows: {"method", "metric", "value", "unit"}; move rate is None when K == 0."""
     if action not in ("add", "remove"):
         raise ValueError(f"unknown action: {action}")
@@ -232,7 +249,7 @@ def compare_with_mod_n(system: HotelSystem, action: str, node_id: int) -> list[d
     change = ch_system.add_building if action == "add" else ch_system.remove_building
     report, t_ch = time_call(change, node_id)
 
-    moved_mod, t_mod = _mod_n_change(system, action, node_id)
+    moved_mod, t_mod = _mod_n_change(system, action, node_id, building_order=building_order)
     rate_mod = moved_mod / k if k > 0 else None
 
     return [

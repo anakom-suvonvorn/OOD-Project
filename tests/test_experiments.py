@@ -49,6 +49,35 @@ class ModNComparisonTests(unittest.TestCase):
         moved, _ = _mod_n_change(self.system, "add", 6)
         self.assertEqual(moved, self.expected_mod_n_moves("add", 6))
 
+    def test_building_order_is_used(self):
+        system = HotelSystem.initialize(5, 1, [1], hash_fn=lambda _key: 5)
+        system.add_building(7)
+        system.add_building(6)
+        order = [1, 2, 3, 4, 5, 7, 6]
+        router = ModNRouter()
+        router.build(order)
+        positions = [guest.pos for guest in system.guests()]
+        before = [router.node_for(pos) for pos in positions]
+        # Removing 6 changes a different index in the two orders.
+        router.remove_node(6)
+        expected = sum(old != router.node_for(pos) for old, pos in zip(before, positions))
+
+        moved, _ = _mod_n_change(system, "remove", 6, building_order=order)
+        sorted_moves, _ = _mod_n_change(system, "remove", 6)
+        rows = compare_with_mod_n(system, "remove", 6, building_order=order)
+
+        self.assertEqual(moved, expected)
+        self.assertNotEqual(moved, sorted_moves)
+        self.assertEqual(by_metric(rows, "mod_n")["moves_remove"], expected)
+
+    def test_building_order_must_match(self):
+        for order in ([1, 2, 3], [1, 2, 3, 4, 6], [1, 2, 3, 4, 5, 5]):
+            with self.subTest(order=order):
+                with self.assertRaisesRegex(
+                    ValueError, "building_order must contain exactly the current buildings"
+                ):
+                    _mod_n_change(self.system, "remove", 3, building_order=order)
+
     def test_compare_does_not_change_the_system(self):
         before = self.system.assignments()
         for action, node_id in (("add", 6), ("remove", 3)):
