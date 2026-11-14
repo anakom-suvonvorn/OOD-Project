@@ -1,20 +1,309 @@
-"""Text menu (owner: P5). The only place that uses print() / input().
-
-Every core call is wrapped so a HotelError is shown as a message and the menu keeps running.
-Large lists show the first 50 rows plus the total count.
-"""
+"""Terminal menu for the Distributed Hilbert's Hotel simulation."""
 from __future__ import annotations
 
-from hotel import HotelError, HotelSystem
+from itertools import islice
+
+from experiments.measure import measure_memory, time_call
+from hotel import HotelError, HotelSystem, MoveReport
+from hotel.guest import Guest
+from hotel.mod_n import ModNRouter
+
+from .csv_export import export_guests, export_moves, export_rows
+
+DISPLAY_LIMIT = 50
+LOOKUP_COUNT = 1000
+MENU_GROUPS = (
+    ("HOTEL", ("1", "5", "6", "10")),
+    ("GUESTS & ROOMS", ("2", "3", "4", "7", "8", "9")),
+    ("EXPERIMENTS & FILES", ("11", "12", "13")),
+)
+
+
+def read_int(label: str, minimum: int = 1) -> int:
+    try:
+        value = int(input(f"{label}: "))
+    except ValueError:
+        raise ValueError(f"{label} must be an integer.") from None
+    if value < minimum:
+        raise ValueError(f"{label} must be at least {minimum}.")
+    return value
+
+
+def format_ratio(value: float | None) -> str:
+    return "N/A (no guests)" if value is None else f"{value:.2%}"
+
+
+def show_guest(guest: Guest) -> None:
+    print(f"Guest ({guest.c}, {guest.s}) | Building {guest.node_id} | Room {guest.room_no}")
+
+
+def show_count(shown: int, total: int) -> None:
+    if shown < total:
+        print(f"Showing {shown:,} of {total:,} rows.")
+
+
+def show_table(headers: tuple[str, ...], rows: list[tuple[int, ...]]) -> None:
+    cells = [headers, *(tuple(map(str, row)) for row in rows)]
+    widths = [max(map(len, column)) for column in zip(*cells)]
+    for row in cells:
+        print("  ".join(cell.ljust(width) for cell, width in zip(row, widths)).rstrip())
 
 
 class Menu:
     def __init__(self) -> None:
         self.system: HotelSystem | None = None
+        self.building_order: list[int] = []
+        self.last_moves: MoveReport | None = None
+        self.last_results: list[dict] = []
 
     def run(self) -> None:
-        """Main loop. Options (see PLAN.md section 8.6):
-        1 new system, 2 add guest, 3 add batch, 4 remove guest, 5 add building,
-        6 remove building, 7 find by guest id, 8 find by room, 9 list rooms,
-        10 load report, 11 benchmark, 12 compare with hash mod N, 13 export CSV, 0 quit."""
-        raise NotImplementedError("P5")
+        labels = {
+            "1": "Set up a hotel",
+            "2": "Check in one guest",
+            "3": "Check in a group",
+            "4": "Check out a guest",
+            "5": "Add a building",
+            "6": "Remove a building",
+            "7": "Find a guest by ID",
+            "8": "Find a guest by room",
+            "9": "List occupied rooms",
+            "10": "Show guests per building",
+            "11": "Measure time and memory",
+            "12": "Compare with Hash mod N",
+            "13": "Export CSV",
+        }
+        actions = {
+            "2": self._add_guest,
+            "3": self._add_guests,
+            "4": self._remove_guest,
+            "5": self._add_building,
+            "6": self._remove_building,
+            "7": self._find_guest,
+            "8": self._find_room,
+            "9": self._list_rooms,
+            "10": self._show_load,
+            "11": self._benchmark,
+            "12": self._compare,
+            "13": self._export,
+        }
+        print("\nDistributed Hilbert's Hotel")
+        print("=" * 43)
+        self._show_menu(labels)
+        try:
+            while True:
+                choice = input("\nSelect an option [Enter for menu, 0 to exit]: ").strip()
+                if choice == "0":
+                    break
+                try:
+                    if choice in {"", "?"}:
+                        self._show_menu(labels)
+                    elif choice == "1":
+                        self._initialize()
+                    elif choice not in actions:
+                        print("Unknown option. Choose a number from the menu.")
+                    elif self.system is None:
+                        print("Choose 1 to set up a hotel first.")
+                    else:
+                        print(f"\n{labels[choice]}")
+                        actions[choice](self.system)
+                except (HotelError, ValueError, OSError) as error:
+                    print(f"Could not complete the action. {error}")
+        except (EOFError, KeyboardInterrupt):
+            print()
+        print("Goodbye.")
+
+    def _show_menu(self, labels: dict[str, str]) -> None:
+        if self.system is None:
+            print("Choose 1 to set up your hotel.")
+        else:
+            print(f"Buildings: {len(self.building_order):,} | Guests: {self.system.guest_count:,}"
+                  f" | Virtual nodes per building: {self.system.V:,}")
+        for title, options in MENU_GROUPS:
+            print(f"\n{title}")
+            for option in options:
+                print(f"  {option:>2}  {labels[option]}")
+
+    def _initialize(self) -> None:
+        print("\nSet up a hotel" if self.system is None else "\nSet up a replacement hotel")
+        if self.system is not None:
+            answer = input("Start over and discard the current hotel? [y/N]: ").strip().lower()
+            if answer not in {"y", "yes"}:
+                return
+        n = read_int("Number of buildings (N)")
+        v = read_int("Virtual nodes per building (V)")
+        channels = read_int("Number of channels", minimum=0)
+        sizes = [read_int(f"Guests in channel {c}", minimum=0) for c in range(1, channels + 1)]
+        salt = input("Salt (Enter for the default): ")
+        self.system = HotelSystem.initialize(n, v, sizes, salt)
+        self.building_order = self.system.node_ids()
+        self.last_moves = None
+        self.last_results = []
+        print(f"Hotel ready | Buildings: {n:,} | Guests: {self.system.guest_count:,}")
+
+    def _add_guest(self, system: HotelSystem) -> None:
+        guest = system.add_guest(read_int("Channel ID"), read_int("Sequence ID"))
+        show_guest(guest)
+
+    def _add_guests(self, system: HotelSystem) -> None:
+        guests = system.add_guests(
+            read_int("Channel ID"), read_int("First sequence ID"), read_int("Guest count", minimum=0)
+        )
+        print(f"Added {len(guests)} guests.")
+
+    def _remove_guest(self, system: HotelSystem) -> None:
+        guest = system.remove_guest(read_int("Channel ID"), read_int("Sequence ID"))
+        print(f"Removed guest ({guest.c}, {guest.s}).")
+
+    def _add_building(self, system: HotelSystem) -> None:
+        node = read_int("Building ID")
+        report = system.add_building(node)
+        self.building_order.append(node)
+        print(f"Added building {node}.")
+        self._show_moves(report)
+
+    def _remove_building(self, system: HotelSystem) -> None:
+        node = read_int("Building ID")
+        report = system.remove_building(node)
+        self.building_order.remove(node)
+        print(f"Removed building {node}.")
+        self._show_moves(report)
+
+    def _show_moves(self, report: MoveReport) -> None:
+        self.last_moves = report
+        print(f"Moved {report.moved_count} of {report.total_guests} guests.")
+        print(f"Move rate: {format_ratio(report.move_rate)}")
+        preview = report.moves[:DISPLAY_LIMIT]
+        if preview:
+            show_table(
+                ("Channel", "Sequence", "From building", "To building", "Room"),
+                [(m.c, m.s, m.old_node, m.new_node, m.room_no) for m in preview],
+            )
+            show_count(len(preview), report.moved_count)
+        path = input("Save the move report? Enter a CSV filename or press Enter to skip: ").strip()
+        if path:
+            print(f"Saved {export_moves(report, path)} rows to {path}.")
+
+    def _find_guest(self, system: HotelSystem) -> None:
+        show_guest(system.find_guest(read_int("Channel ID"), read_int("Sequence ID")))
+
+    def _find_room(self, system: HotelSystem) -> None:
+        show_guest(system.find_by_room(read_int("Building ID"), read_int("Room number")))
+
+    def _list_rooms(self, system: HotelSystem) -> None:
+        rooms = system.list_rooms()
+        if not rooms:
+            print("There are no occupied rooms.")
+            return
+        preview = rooms[:DISPLAY_LIMIT]
+        print(f"Occupied rooms: {len(rooms):,}")
+        show_table(
+            ("Building", "Room", "Channel", "Sequence"),
+            [(g.node_id, g.room_no, g.c, g.s) for g in preview],
+        )
+        show_count(len(preview), len(rooms))
+
+    def _show_load(self, system: HotelSystem) -> None:
+        stats = system.load_stats()
+        for node, count in islice(stats.counts.items(), DISPLAY_LIMIT):
+            print(f"Building {node}: {count} guests")
+        show_count(min(len(stats.counts), DISPLAY_LIMIT), len(stats.counts))
+        print(f"Total {stats.total} | Min {stats.minimum} | Max {stats.maximum}")
+        print(f"Mean {stats.mean:.2f} | Std dev {stats.std:.2f} | CV {format_ratio(stats.cv)}")
+
+    def _benchmark(self, system: HotelSystem) -> None:
+        sample = list(islice(system.guests(), LOOKUP_COUNT))
+
+        def find_guests() -> None:
+            for i in range(LOOKUP_COUNT):
+                guest = sample[i % len(sample)]
+                system.find_guest(guest.c, guest.s)
+
+        def find_rooms() -> None:
+            for i in range(LOOKUP_COUNT):
+                guest = sample[i % len(sample)]
+                system.find_by_room(guest.node_id, guest.room_no)
+
+        metrics = []
+        if sample:
+            _, guest_time = time_call(find_guests)
+            _, room_time = time_call(find_rooms)
+            metrics.extend([
+                ("find_guest_per_lookup", guest_time / LOOKUP_COUNT, "seconds"),
+                ("find_room_per_lookup", room_time / LOOKUP_COUNT, "seconds"),
+            ])
+        else:
+            print("Lookup timings skipped because the hotel has no guests.")
+        _, list_time = time_call(system.list_rooms)
+        _, current, peak = measure_memory(system.list_rooms)
+        metrics.extend([
+            ("list_rooms_time", list_time, "seconds"),
+            ("list_rooms_current_allocations", current, "MiB"),
+            ("list_rooms_peak_allocations", peak, "MiB"),
+        ])
+        print(f"N={len(self.building_order)} | V={system.V} | K={system.guest_count} | salt={system.salt!r}")
+        print("Allocation measurements cover list_rooms only.")
+        self.last_results = []
+        for metric, value, unit in metrics:
+            print(f"{metric}: {value:.9g} {unit}")
+            self.last_results.append({
+                "N": len(self.building_order), "V": system.V, "K": system.guest_count,
+                "salt": system.salt, "metric": metric, "value": value, "unit": unit,
+            })
+
+    def _compare(self, system: HotelSystem) -> None:
+        action = input("Compare add or remove? ").strip().lower()
+        if action not in {"add", "remove"}:
+            raise ValueError("Enter add or remove.")
+        node = read_int("Building ID")
+        ring = system.clone().ring
+        baseline = ModNRouter()
+        baseline.build(self.building_order)
+        positions = [guest.pos for guest in system.guests()]
+        rows = []
+        for method, router in (("Consistent Hashing", ring), ("Hash mod N", baseline)):
+            before = [router.node_for(pos) for pos in positions]
+
+            def change_and_count() -> int:
+                if action == "add":
+                    router.add_node(node)
+                else:
+                    router.remove_node(node)
+                return sum(old != router.node_for(pos) for old, pos in zip(before, positions))
+
+            moved, seconds = time_call(change_and_count)
+            rate = moved / len(positions) if positions else None
+            rows.append({
+                "method": method, "action": action, "node_id": node, "N": len(self.building_order),
+                "V": system.V, "K": len(positions), "salt": system.salt,
+                "moved": moved, "move_rate": rate, "seconds": seconds,
+            })
+        self.last_results = rows
+        print("Timing: update routing and recount all guest assignments for both methods.")
+        for row in rows:
+            print(f"{row['method']}: {row['moved']} of {row['K']} moved "
+                  f"({format_ratio(row['move_rate'])}) | {row['seconds']:.6f} seconds")
+
+    def _export(self, system: HotelSystem) -> None:
+        print("  1  Current guests\n  2  Latest building move report\n  3  Latest experiment results")
+        selection = input("Select what to export [Enter to go back]: ").strip().lower()
+        if not selection:
+            return
+        kind = {"1": "guests", "2": "moves", "3": "results"}.get(selection, selection)
+        if kind not in {"guests", "moves", "results"}:
+            raise ValueError("Choose 1 for guests, 2 for moves, or 3 for results.")
+        if kind == "moves" and self.last_moves is None:
+            print("Add or remove a building first to create a move report.")
+            return
+        if kind == "results" and not self.last_results:
+            print("Run option 11 or 12 first to create results.")
+            return
+        path = input(f"CSV filename [e.g. {kind}.csv, Enter to go back]: ").strip()
+        if not path:
+            return
+        if kind == "guests":
+            count = export_guests(system, path)
+        elif kind == "moves":
+            count = export_moves(self.last_moves, path)
+        else:
+            count = export_rows(self.last_results, path)
+        print(f"Saved {count} rows to {path}.")
