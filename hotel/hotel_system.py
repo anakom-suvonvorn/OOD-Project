@@ -77,11 +77,7 @@ class HotelSystem:
     def clone(self) -> HotelSystem:
         """Independent copy (same V, salt, hash_fn, buildings, guests) for experiments."""
         copy_sys = HotelSystem(self.V, salt=self.salt, hash_fn=self._hash_fn)
-        # Copy ring state directly without re-hashing
-        copy_sys.ring._points = list(self.ring._points)
-        copy_sys.ring._points_by_node = {
-            nid: list(pts) for nid, pts in self.ring._points_by_node.items()
-        }
+        copy_sys.ring = self.ring.copy()  # same points, no re-hashing
         # Copy all guests with their existing pos and point
         for g in self.store:
             new_g = Guest(g.c, g.s, g.pos)
@@ -126,10 +122,10 @@ class HotelSystem:
         validate_guest_id(c, s_start)
         if not isinstance(count, int) or isinstance(count, bool) or count < 0:
             raise InvalidInputError(f"count must be an integer >= 0, got {count!r}")
-        if self.ring.node_count == 0:
-            raise EmptyRingError("there are no buildings yet")
         if count == 0:
             return []
+        if self.ring.node_count == 0:
+            raise EmptyRingError("there are no buildings yet")
 
         # All-or-nothing check: verify none of the IDs exist first
         for s in range(s_start, s_start + count):
