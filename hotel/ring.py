@@ -133,6 +133,15 @@ class HashRing:
             raise ValueError(f"{point} is not on the ring")
         return self._points[(i + 1) % len(self._points)]
 
+    def copy(self) -> HashRing:
+        """Independent copy with the same V, salt, hash function and points; no rehashing. O(M).
+
+        RingPoint is an immutable tuple, so the points themselves can be shared."""
+        ring = HashRing(self.V, self.salt, self._hash)
+        ring._points = list(self._points)
+        ring._points_by_node = {node_id: list(pts) for node_id, pts in self._points_by_node.items()}
+        return ring
+
     def has_node(self, node_id: int) -> bool:
         return node_id in self._points_by_node
 

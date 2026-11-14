@@ -75,6 +75,13 @@ class TestHotelGuests(unittest.TestCase):
         sys = HotelSystem(vnodes_per_node=4)
         with self.assertRaises(EmptyRingError):
             sys.add_guest(1, 1)
+        with self.assertRaises(EmptyRingError):
+            sys.add_guests(1, 1, 3)
+
+    def test_batch_of_zero_changes_nothing_even_without_buildings(self):
+        sys = HotelSystem(vnodes_per_node=4)
+        self.assertEqual(sys.add_guests(1, 1, 0), [])
+        self.assertEqual(sys.guest_count, 0)
 
 
 if __name__ == "__main__":
