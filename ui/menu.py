@@ -3,15 +3,13 @@ from __future__ import annotations
 
 from itertools import islice
 
-from experiments.measure import measure_memory, time_call
+from experiments.run_experiments import benchmark_system, compare_with_mod_n
 from hotel import HotelError, HotelSystem, MoveReport
 from hotel.guest import Guest
-from hotel.mod_n import ModNRouter
 
 from .csv_export import export_guests, export_moves, export_rows
 
 DISPLAY_LIMIT = 50
-LOOKUP_COUNT = 1000
 MENU_GROUPS = (
     ("HOTEL", ("1", "5", "6", "10")),
     ("GUESTS & ROOMS", ("2", "3", "4", "7", "8", "9")),
@@ -31,6 +29,10 @@ def read_int(label: str, minimum: int = 1) -> int:
 
 def format_ratio(value: float | None) -> str:
     return "N/A (no guests)" if value is None else f"{value:.2%}"
+
+
+def plural(count: int, word: str) -> str:
+    return f"{count:,} {word}{'' if count == 1 else 's'}"
 
 
 def show_guest(guest: Guest) -> None:
@@ -148,7 +150,7 @@ class Menu:
         guests = system.add_guests(
             read_int("Channel ID"), read_int("First sequence ID"), read_int("Guest count", minimum=0)
         )
-        print(f"Added {len(guests)} guests.")
+        print(f"Added {plural(len(guests), 'guest')}.")
 
     def _remove_guest(self, system: HotelSystem) -> None:
         guest = system.remove_guest(read_int("Channel ID"), read_int("Sequence ID"))
@@ -170,7 +172,7 @@ class Menu:
 
     def _show_moves(self, report: MoveReport) -> None:
         self.last_moves = report
-        print(f"Moved {report.moved_count} of {report.total_guests} guests.")
+        print(f"Moved {report.moved_count:,} of {plural(report.total_guests, 'guest')}.")
         print(f"Move rate: {format_ratio(report.move_rate)}")
         preview = report.moves[:DISPLAY_LIMIT]
         if preview:
@@ -181,7 +183,12 @@ class Menu:
             show_count(len(preview), report.moved_count)
         path = input("Save the move report? Enter a CSV filename or press Enter to skip: ").strip()
         if path:
-            print(f"Saved {export_moves(report, path)} rows to {path}.")
+            try:
+                count = export_moves(report, path)
+            except OSError as error:
+                print(f"The building change was done, but the CSV could not be saved: {error}")
+            else:
+                print(f"Saved {plural(count, 'row')} to {path}.")
 
     def _find_guest(self, system: HotelSystem) -> None:
         show_guest(system.find_guest(read_int("Channel ID"), read_int("Sequence ID")))
@@ -205,83 +212,43 @@ class Menu:
     def _show_load(self, system: HotelSystem) -> None:
         stats = system.load_stats()
         for node, count in islice(stats.counts.items(), DISPLAY_LIMIT):
-            print(f"Building {node}: {count} guests")
+            print(f"Building {node}: {plural(count, 'guest')}")
         show_count(min(len(stats.counts), DISPLAY_LIMIT), len(stats.counts))
         print(f"Total {stats.total} | Min {stats.minimum} | Max {stats.maximum}")
-        print(f"Mean {stats.mean:.2f} | Std dev {stats.std:.2f} | CV {format_ratio(stats.cv)}")
+        cv = "N/A (no guests)" if stats.cv is None else f"{stats.cv:.3f}"
+        print(f"Mean {stats.mean:.2f} | Std dev {stats.std:.2f} | CV {cv}")
 
     def _benchmark(self, system: HotelSystem) -> None:
-        sample = list(islice(system.guests(), LOOKUP_COUNT))
-
-        def find_guests() -> None:
-            for i in range(LOOKUP_COUNT):
-                guest = sample[i % len(sample)]
-                system.find_guest(guest.c, guest.s)
-
-        def find_rooms() -> None:
-            for i in range(LOOKUP_COUNT):
-                guest = sample[i % len(sample)]
-                system.find_by_room(guest.node_id, guest.room_no)
-
-        metrics = []
-        if sample:
-            _, guest_time = time_call(find_guests)
-            _, room_time = time_call(find_rooms)
-            metrics.extend([
-                ("find_guest_per_lookup", guest_time / LOOKUP_COUNT, "seconds"),
-                ("find_room_per_lookup", room_time / LOOKUP_COUNT, "seconds"),
-            ])
-        else:
-            print("Lookup timings skipped because the hotel has no guests.")
-        _, list_time = time_call(system.list_rooms)
-        _, current, peak = measure_memory(system.list_rooms)
-        metrics.extend([
-            ("list_rooms_time", list_time, "seconds"),
-            ("list_rooms_current_allocations", current, "MiB"),
-            ("list_rooms_peak_allocations", peak, "MiB"),
-        ])
-        print(f"N={len(self.building_order)} | V={system.V} | K={system.guest_count} | salt={system.salt!r}")
-        print("Allocation measurements cover list_rooms only.")
-        self.last_results = []
-        for metric, value, unit in metrics:
-            print(f"{metric}: {value:.9g} {unit}")
-            self.last_results.append({
-                "N": len(self.building_order), "V": system.V, "K": system.guest_count,
-                "salt": system.salt, "metric": metric, "value": value, "unit": unit,
-            })
+        rows = benchmark_system(system)
+        params = rows[0]
+        print(f"N={params['N']} | V={params['V']} | K={params['K']} | salt={params['salt']!r}")
+        for row in rows:
+            print(f"{row['metric']}: {row['value']:.9g} {row['unit']}")
+        print("Memory is what Python's tracemalloc traces for a full copy of the hotel, not the whole process.")
+        self.last_results = rows
 
     def _compare(self, system: HotelSystem) -> None:
         action = input("Compare add or remove? ").strip().lower()
         if action not in {"add", "remove"}:
             raise ValueError("Enter add or remove.")
         node = read_int("Building ID")
-        ring = system.clone().ring
-        baseline = ModNRouter()
-        baseline.build(self.building_order)
-        positions = [guest.pos for guest in system.guests()]
-        rows = []
-        for method, router in (("Consistent Hashing", ring), ("Hash mod N", baseline)):
-            before = [router.node_for(pos) for pos in positions]
-
-            def change_and_count() -> int:
-                if action == "add":
-                    router.add_node(node)
-                else:
-                    router.remove_node(node)
-                return sum(old != router.node_for(pos) for old, pos in zip(before, positions))
-
-            moved, seconds = time_call(change_and_count)
-            rate = moved / len(positions) if positions else None
-            rows.append({
-                "method": method, "action": action, "node_id": node, "N": len(self.building_order),
-                "V": system.V, "K": len(positions), "salt": system.salt,
-                "moved": moved, "move_rate": rate, "seconds": seconds,
-            })
-        self.last_results = rows
-        print("Timing: update routing and recount all guest assignments for both methods.")
-        for row in rows:
-            print(f"{row['method']}: {row['moved']} of {row['K']} moved "
-                  f"({format_ratio(row['move_rate'])}) | {row['seconds']:.6f} seconds")
+        rows = compare_with_mod_n(system, action, node, building_order=self.building_order)
+        guest_count = system.guest_count
+        print("Timing: consistent hashing = the real add/remove on a copy of the hotel; "
+              "hash mod N = update the building list + recompute every guest.")
+        for method, label in (("consistent", "Consistent hashing"), ("mod_n", "Hash mod N")):
+            values = {row["metric"]: row["value"] for row in rows if row["method"] == method}
+            moved = values[f"moves_{action}"]
+            rate = format_ratio(values[f"move_rate_{action}"])
+            seconds = values[f"time_{action}"]
+            print(f"{label}: {moved:,} of {guest_count:,} moved ({rate}) | {seconds:.6f} seconds")
+        self.last_results = [
+            {
+                **row, "action": action, "node_id": node, "N": len(self.building_order),
+                "V": system.V, "K": guest_count, "salt": system.salt,
+            }
+            for row in rows
+        ]
 
     def _export(self, system: HotelSystem) -> None:
         print("  1  Current guests\n  2  Latest building move report\n  3  Latest experiment results")
@@ -306,4 +273,4 @@ class Menu:
             count = export_moves(self.last_moves, path)
         else:
             count = export_rows(self.last_results, path)
-        print(f"Saved {count} rows to {path}.")
+        print(f"Saved {plural(count, 'row')} to {path}.")
