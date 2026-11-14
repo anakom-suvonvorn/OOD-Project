@@ -229,6 +229,16 @@ class BuildAndChangeTests(unittest.TestCase):
             else:
                 self.assertEqual(a, b)
 
+    def test_copy_is_independent(self):
+        ring = real_ring(3, 4, salt="1")
+        copy = ring.copy()
+        self.assertEqual(copy.points(), ring.points())
+        self.assertEqual((copy.V, copy.salt), (4, "1"))
+        copy.add_node(4)
+        ring.remove_node(1)
+        self.assertEqual(copy.node_ids(), [1, 2, 3, 4])
+        self.assertEqual(ring.node_ids(), [2, 3])
+
     def test_salt_gives_different_ring(self):
         self.assertNotEqual(real_ring(3, 4).points(), real_ring(3, 4, salt="1").points())
 
