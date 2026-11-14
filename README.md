@@ -5,8 +5,6 @@ Each guest's room number comes from the Cantor pairing of `(c, s)`, so it never 
 comes from a SHA-256 hash ring with virtual nodes, so adding or removing a building moves only about
 K/N guests. The project also compares this with `hash mod N`.
 
-Team plan, design decisions and API contract: [PLAN.md](PLAN.md).
-
 ## Requirements
 
 - **Python 3.12** (developed and tested on 3.12.0; the code also runs on 3.11).
@@ -43,7 +41,8 @@ python -m unittest discover -s tests -v
 | `tests/test_hotel_guests.py` | adding guests never moves existing guests, all-or-nothing batches, searches, K = 0 |
 | `tests/test_building.py` | guests move only into a new building / only out of a removed one, bucket method equals rechecking every guest, all building edge cases |
 | `tests/test_csv_export.py` | CSV row counts equal the number of guests / moves, UTF-8 |
-| `tests/test_experiments.py` | hash mod N comparison uses real building ids, benchmark and comparison never change the hotel |
+| `tests/test_experiments.py` | hash mod N comparison uses real building ids and the real order buildings were added, benchmark and comparison never change the hotel |
+| `tests/test_menu.py` | the menu driven by scripted input: bad input and invalid actions give a message instead of crashing, option 12 never changes the hotel, CSV exports have the right row counts |
 
 ## Run the experiments and draw the graphs
 
@@ -67,6 +66,19 @@ Result CSVs use one row per measurement: `experiment, method, salt, K, N, V, met
 Times use `time.perf_counter()`; memory uses `tracemalloc` in a separate run from timing and is the
 memory Python traces, not the whole process.
 
+## Sample CSV files
+
+```
+python -m experiments.make_samples
+```
+
+Writes sample output for one hotel (N = 10, V = 32, 10 channels × 100 guests, salt `"0"`):
+`results/sample_guests.csv` (every guest: `channel_id, sequence_id, node_id, room_no`),
+`results/sample_moves_add.csv` (moves when building 11 is added) and `results/sample_moves_remove.csv`
+(moves when building 6 is removed, starting again from the same hotel). `results/sample_info.csv`
+lists the parameters, salt and row count of each file. The same files can be made by hand with menu
+option 13.
+
 ## Project structure
 
 ```
@@ -80,7 +92,7 @@ hotel/                  core logic, no printing or input
   hotel_system.py       HotelSystem: the public API used by the menu and experiments
   models.py, errors.py  shared data types and error classes
 ui/                     text menu and CSV export
-experiments/            experiment runner, timing/memory helpers, graph plotting
+experiments/            experiment runner, timing/memory helpers, graph plotting, sample CSVs
 tests/                  unittest test suite
-results/                experiment CSVs and graphs
+results/                experiment CSVs, sample CSVs and graphs
 ```
